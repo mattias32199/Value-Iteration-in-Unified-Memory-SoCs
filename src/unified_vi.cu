@@ -1,24 +1,33 @@
-// discrete_vi.cu
+// unified_vi.cu
+
 /*
- * Discrete-memory CUDA value iteration (baseline).
+ * Unified memory CUDA value iteration.
  *
- * Standard GPU-accelerated approach:
- *   - Host allocates with malloc, device allocates with cudaMalloc
- *   - Explicit cudaMemcpy to transfer data between CPU and GPU
- *   - Bellman update kernel: one thread per state
- *   - Parallel reduction kernel: computes max |V_new - V_old|
- *   - Convergence check on CPU after each sweep
+ * Uses cudaMallocManaged for all allocations:
+ *   - Single pointer accessible by both CPU and GPU
+ *   - No explicit cudaMemcpy transfers
+ *   - CPU builds grid world directly in managed memory
+ *   - Same Bellman update and reduction kernels as discrete version
  *
- * This is the conventional approach that the unified memory
- * version will be compared against.
+ * On discrete GPU (e.g., Colab T4/L4): the CUDA runtime migrates
+ * pages on demand via page faults. Performance depends on access
+ * patterns and driver-level migration.
+ *
+ * On unified memory SoC (e.g., Jetson Orin Nano): CPU and GPU
+ * share the same physical memory. No migration needed, just
+ * cache coherency management.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 #include <float.h>
 
-/* Include the grid world as C code */
+#ifndef USE_PREFETCH
+#define USE_PREFETCH 0
+#endif
+
 extern "C" {
 #include "gridworld.h"
 }
@@ -37,20 +46,16 @@ extern "C" {
     } while (0)
 
 /* ----------------------------------------------------------------
- * Bellman update kernel
- *
- * Each thread processes one state. Computes the best Q-value
- * across all actions and writes the result to V_next.
- * Also computes |V_next[s] - V_curr[s]| into a delta array.
+ * Bellman update kernel (identical to discrete version)
  * ---------------------------------------------------------------- */
 __global__ void bellman_update_kernel(
-    const int *transitions,     /* [num_states * NUM_ACTIONS] */
-    const float *rewards,       /* [num_states * NUM_ACTIONS] */
+    const int *transitions,
+    const float *rewards,
     const int8_t *is_terminal,
     const int8_t *is_obstacle,
     const float *V_curr,
     float *V_next,
-    float *deltas,              /* per-state delta for reduction */
+    float *deltas,
     int *policy,
     int num_states,
     float gamma)
@@ -58,7 +63,6 @@ __global__ void bellman_update_kernel(
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= num_states) return;
 
-    /* Terminal and obstacle states stay at 0 */
     if (is_terminal[s] || is_obstacle[s]) {
         V_next[s] = 0.0f;
         deltas[s] = 0.0f;
@@ -89,11 +93,7 @@ __global__ void bellman_update_kernel(
 }
 
 /* ----------------------------------------------------------------
- * Parallel max reduction kernel
- *
- * Reduces the deltas array to find the maximum value.
- * Uses shared memory and sequential addressing for efficiency.
- * Each block reduces its portion, then we reduce across blocks.
+ * Parallel max reduction kernel (identical to discrete version)
  * ---------------------------------------------------------------- */
 __global__ void max_reduce_kernel(
     const float *input,
@@ -105,14 +105,12 @@ __global__ void max_reduce_kernel(
     int tid = threadIdx.x;
     int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
 
-    /* Load two elements per thread into shared memory */
     float val = 0.0f;
     if (i < n) val = input[i];
     if (i + blockDim.x < n) val = fmaxf(val, input[i + blockDim.x]);
     sdata[tid] = val;
     __syncthreads();
 
-    /* Reduction in shared memory */
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
@@ -120,7 +118,6 @@ __global__ void max_reduce_kernel(
         __syncthreads();
     }
 
-    /* Write block result */
     if (tid == 0) {
         output[blockIdx.x] = sdata[0];
     }
@@ -128,9 +125,6 @@ __global__ void max_reduce_kernel(
 
 /* ----------------------------------------------------------------
  * Host-side max reduction
- *
- * Launches reduction kernels iteratively until we have a single
- * value, then copies it back to the host.
  * ---------------------------------------------------------------- */
 float gpu_max_reduce(float *d_input, float *d_workspace, int n) {
     int threads = 256;
@@ -147,16 +141,85 @@ float gpu_max_reduce(float *d_input, float *d_workspace, int n) {
 
         n = blocks;
 
-        /* Swap src and dst for next iteration */
         float *tmp = src;
         src = dst;
         dst = tmp;
     }
 
-    /* Copy the single result back to host */
+    /*
+     * In unified memory, we could read *src directly on the CPU
+     * after a cudaDeviceSynchronize(). Using cudaMemcpy here for
+     * consistency with the discrete version — it also acts as
+     * an implicit sync. On the Jetson, you could instead do:
+     *   cudaDeviceSynchronize();
+     *   return *src;
+     */
     CUDA_CHECK(cudaMemcpy(&h_result, src, sizeof(float),
                           cudaMemcpyDeviceToHost));
     return h_result;
+}
+
+/* ----------------------------------------------------------------
+ * Build grid world directly into managed memory.
+ *
+ * Instead of building in host memory and copying to device,
+ * we allocate managed memory first and have the CPU write
+ * the grid world data directly into it.
+ * ---------------------------------------------------------------- */
+typedef struct {
+    int *transitions;
+    float *rewards;
+    int8_t *is_terminal;
+    int8_t *is_obstacle;
+    int num_states;
+    int rows;
+    int cols;
+} ManagedGridWorld;
+
+ManagedGridWorld build_managed_gridworld(int rows, int cols,
+                                         float step_reward,
+                                         float goal_reward) {
+    ManagedGridWorld mgw;
+    mgw.rows = rows;
+    mgw.cols = cols;
+    mgw.num_states = rows * cols;
+    int N = mgw.num_states;
+
+    size_t trans_size  = (size_t)N * NUM_ACTIONS * sizeof(int);
+    size_t reward_size = (size_t)N * NUM_ACTIONS * sizeof(float);
+    size_t flag_size   = (size_t)N * sizeof(int8_t);
+
+    /* Allocate all grid world data in managed memory */
+    CUDA_CHECK(cudaMallocManaged(&mgw.transitions, trans_size));
+    CUDA_CHECK(cudaMallocManaged(&mgw.rewards, reward_size));
+    CUDA_CHECK(cudaMallocManaged(&mgw.is_terminal, flag_size));
+    CUDA_CHECK(cudaMallocManaged(&mgw.is_obstacle, flag_size));
+
+    /* Zero out the flag arrays using cudaMemset for managed memory */
+    CUDA_CHECK(cudaMemset(mgw.is_terminal, 0, flag_size));
+    CUDA_CHECK(cudaMemset(mgw.is_obstacle, 0, flag_size));
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    /*
+     * Reuse the existing gridworld functions by creating a
+     * temporary GridWorld struct that points to managed memory.
+     * The CPU writes directly into the managed allocations.
+     */
+    GridWorld tmp;
+    tmp.rows = rows;
+    tmp.cols = cols;
+    tmp.num_states = N;
+    tmp.step_reward = step_reward;
+    tmp.goal_reward = goal_reward;
+    tmp.transitions = mgw.transitions;
+    tmp.rewards = mgw.rewards;
+    tmp.is_terminal = mgw.is_terminal;
+    tmp.is_obstacle = mgw.is_obstacle;
+
+    gridworld_default_layout(&tmp);
+    gridworld_build_transitions(&tmp);
+
+    return mgw;
 }
 
 /* ----------------------------------------------------------------
@@ -178,7 +241,7 @@ int main(int argc, char **argv) {
 
     int N = rows * cols;
 
-    printf("=== Discrete Memory CUDA Value Iteration ===\n");
+    printf("=== Unified Memory CUDA Value Iteration ===\n");
     printf("Grid: %dx%d (%d states)\n", rows, cols, N);
     printf("Gamma: %.4f\n", gamma_val);
     printf("Threshold: %.1e\n", threshold);
@@ -189,99 +252,100 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("GPU: %s\n", prop.name);
     printf("Compute capability: %d.%d\n", prop.major, prop.minor);
-    printf("Global memory: %.0f MB\n\n",
-           prop.totalGlobalMem / (1024.0 * 1024.0));
+    printf("Global memory: %.0f MB\n", prop.totalGlobalMem / (1024.0 * 1024.0));
+    printf("Managed memory: %s\n", prop.managedMemory ? "yes" : "no");
+    printf("Concurrent managed access: %s\n\n",
+           prop.concurrentManagedAccess ? "yes" : "no");
 
     /* --------------------------------------------------------
-     * Build grid world on the CPU
+     * Build grid world directly in managed memory
      * -------------------------------------------------------- */
-    printf("Building grid world...\n");
-    GridWorld *gw = gridworld_create(rows, cols, -1.0f, 0.0f);
-    if (!gw) return 1;
-    gridworld_default_layout(gw);
-    gridworld_build_transitions(gw);
+    printf("Building grid world in managed memory...\n");
+
+    cudaEvent_t build_start, build_end;
+    CUDA_CHECK(cudaEventCreate(&build_start));
+    CUDA_CHECK(cudaEventCreate(&build_end));
+
+    CUDA_CHECK(cudaEventRecord(build_start));
+
+    ManagedGridWorld mgw = build_managed_gridworld(rows, cols, -1.0f, 0.0f);
+
+    CUDA_CHECK(cudaEventRecord(build_end));
+    CUDA_CHECK(cudaEventSynchronize(build_end));
+
+    float build_ms;
+    CUDA_CHECK(cudaEventElapsedTime(&build_ms, build_start, build_end));
 
     int n_obstacles = 0, n_terminals = 0;
     for (int i = 0; i < N; i++) {
-        n_obstacles += gw->is_obstacle[i];
-        n_terminals += gw->is_terminal[i];
+        n_obstacles += mgw.is_obstacle[i];
+        n_terminals += mgw.is_terminal[i];
     }
-    printf("Grid world ready (%d obstacles, %d terminals)\n\n",
+    printf("Grid world ready (%d obstacles, %d terminals)\n",
            n_obstacles, n_terminals);
+    printf("Build time: %.3f ms\n\n", build_ms);
 
     /* --------------------------------------------------------
-     * Allocate host memory
+     * Allocate value iteration arrays in managed memory
      * -------------------------------------------------------- */
-    float *h_values = (float *)calloc(N, sizeof(float));
-    int *h_policy   = (int *)calloc(N, sizeof(int));
-    if (!h_values || !h_policy) {
-        fprintf(stderr, "Host allocation failed\n");
-        free(h_values);
-        free(h_policy);
-        gridworld_free(gw);
-        return 1;
-    }
+    float *V_curr, *V_next;
+    float *deltas, *reduce_workspace;
+    int *policy;
 
-    /* --------------------------------------------------------
-     * Allocate device memory
-     * -------------------------------------------------------- */
-    int *d_transitions;
-    float *d_rewards;
-    int8_t *d_is_terminal, *d_is_obstacle;
-    float *d_V_curr, *d_V_next;
-    float *d_deltas, *d_reduce_workspace;
-    int *d_policy;
+    size_t value_size  = (size_t)N * sizeof(float);
+    size_t policy_size = (size_t)N * sizeof(int);
 
-    size_t trans_size   = (size_t)N * NUM_ACTIONS * sizeof(int);
-    size_t reward_size  = (size_t)N * NUM_ACTIONS * sizeof(float);
-    size_t flag_size    = (size_t)N * sizeof(int8_t);
-    size_t value_size   = (size_t)N * sizeof(float);
-    size_t policy_size  = (size_t)N * sizeof(int);
-
-    /* Workspace for reduction: needs at most N/2 floats */
     int reduce_blocks = (N + 511) / 512;
     size_t reduce_size = reduce_blocks * sizeof(float);
 
-    CUDA_CHECK(cudaMalloc(&d_transitions, trans_size));
-    CUDA_CHECK(cudaMalloc(&d_rewards, reward_size));
-    CUDA_CHECK(cudaMalloc(&d_is_terminal, flag_size));
-    CUDA_CHECK(cudaMalloc(&d_is_obstacle, flag_size));
-    CUDA_CHECK(cudaMalloc(&d_V_curr, value_size));
-    CUDA_CHECK(cudaMalloc(&d_V_next, value_size));
-    CUDA_CHECK(cudaMalloc(&d_deltas, value_size));
-    CUDA_CHECK(cudaMalloc(&d_reduce_workspace, reduce_size));
-    CUDA_CHECK(cudaMalloc(&d_policy, policy_size));
+    CUDA_CHECK(cudaMallocManaged(&V_curr, value_size));
+    CUDA_CHECK(cudaMallocManaged(&V_next, value_size));
+    CUDA_CHECK(cudaMallocManaged(&deltas, value_size));
+    CUDA_CHECK(cudaMallocManaged(&reduce_workspace, reduce_size));
+    CUDA_CHECK(cudaMallocManaged(&policy, policy_size));
 
-    printf("Device memory allocated: %.2f MB\n",
-           (trans_size + reward_size + 2 * flag_size +
-            3 * value_size + reduce_size + policy_size) / (1024.0 * 1024.0));
+    CUDA_CHECK(cudaMemset(V_curr, 0, value_size));
+    CUDA_CHECK(cudaMemset(V_next, 0, value_size));
+
+    size_t total_managed = (size_t)N * NUM_ACTIONS * sizeof(int)
+                         + (size_t)N * NUM_ACTIONS * sizeof(float)
+                         + (size_t)N * 2 * sizeof(int8_t)
+                         + 3 * value_size
+                         + reduce_size + policy_size;
+    printf("Total managed memory: %.2f MB\n\n",
+           total_managed / (1024.0 * 1024.0));
 
     /* --------------------------------------------------------
-     * Copy data from host to device (initial transfer)
+     * Optional: prefetch managed memory to GPU.
+     *
+     * On discrete GPUs, this avoids page-fault storms on the
+     * first iteration by migrating data before the loop starts.
+     * On Jetson (unified SoC), this is essentially a no-op
+     * since CPU and GPU share the same physical memory.
+     *
+     * Set USE_PREFETCH=1 at compile time to enable:
+     *   nvcc -DUSE_PREFETCH=1 ...
      * -------------------------------------------------------- */
-    cudaEvent_t copy_start, copy_end;
-    CUDA_CHECK(cudaEventCreate(&copy_start));
-    CUDA_CHECK(cudaEventCreate(&copy_end));
+#if USE_PREFETCH
+    {
+        int device;
+        CUDA_CHECK(cudaGetDevice(&device));
 
-    CUDA_CHECK(cudaEventRecord(copy_start));
+        size_t trans_size  = (size_t)N * NUM_ACTIONS * sizeof(int);
+        size_t reward_size = (size_t)N * NUM_ACTIONS * sizeof(float);
+        size_t flag_size   = (size_t)N * sizeof(int8_t);
 
-    CUDA_CHECK(cudaMemcpy(d_transitions, gw->transitions, trans_size,
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_rewards, gw->rewards, reward_size,
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_is_terminal, gw->is_terminal, flag_size,
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_is_obstacle, gw->is_obstacle, flag_size,
-                          cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_V_curr, h_values, value_size,
-                          cudaMemcpyHostToDevice));
-
-    CUDA_CHECK(cudaEventRecord(copy_end));
-    CUDA_CHECK(cudaEventSynchronize(copy_end));
-
-    float copy_to_gpu_ms;
-    CUDA_CHECK(cudaEventElapsedTime(&copy_to_gpu_ms, copy_start, copy_end));
-    printf("Initial copy to GPU: %.3f ms\n\n", copy_to_gpu_ms);
+        printf("Prefetching managed memory to GPU...\n");
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.transitions, trans_size, device));
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.rewards, reward_size, device));
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_terminal, flag_size, device));
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_obstacle, flag_size, device));
+        CUDA_CHECK(cudaMemPrefetchAsync(V_curr, value_size, device));
+        CUDA_CHECK(cudaMemPrefetchAsync(V_next, value_size, device));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        printf("Prefetch complete.\n\n");
+    }
+#endif
 
     /* --------------------------------------------------------
      * Value iteration loop
@@ -289,11 +353,6 @@ int main(int argc, char **argv) {
     int threads_per_block = 256;
     int blocks = (N + threads_per_block - 1) / threads_per_block;
 
-    cudaEvent_t iter_start, iter_end;
-    CUDA_CHECK(cudaEventCreate(&iter_start));
-    CUDA_CHECK(cudaEventCreate(&iter_end));
-
-    /* Time the entire iteration loop */
     cudaEvent_t loop_start, loop_end;
     CUDA_CHECK(cudaEventCreate(&loop_start));
     CUDA_CHECK(cudaEventCreate(&loop_end));
@@ -303,41 +362,36 @@ int main(int argc, char **argv) {
 
     int iter;
     float max_delta;
-    float *d_V_final = d_V_next; /* tracks where the latest values are */
+    float *V_final = V_next;
 
     for (iter = 0; iter < max_iters; iter++) {
 
-        /* Launch Bellman update kernel */
         bellman_update_kernel<<<blocks, threads_per_block>>>(
-            d_transitions, d_rewards,
-            d_is_terminal, d_is_obstacle,
-            d_V_curr, d_V_next,
-            d_deltas, d_policy,
+            mgw.transitions, mgw.rewards,
+            mgw.is_terminal, mgw.is_obstacle,
+            V_curr, V_next,
+            deltas, policy,
             N, gamma_val);
         CUDA_CHECK(cudaGetLastError());
 
-        /* Compute max delta via parallel reduction */
-        max_delta = gpu_max_reduce(d_deltas, d_reduce_workspace, N);
+        max_delta = gpu_max_reduce(deltas, reduce_workspace, N);
 
-        /* Print progress */
         if ((iter + 1) % 100 == 0 || iter == 0) {
             printf("  Iteration %d: max_delta = %.8f\n",
                    iter + 1, max_delta);
         }
 
-        /* Check convergence */
         if (max_delta < threshold) {
             printf("  Converged at iteration %d (max_delta = %.8f)\n",
                    iter + 1, max_delta);
-            d_V_final = d_V_next; /* kernel just wrote here */
+            V_final = V_next;
             break;
         }
 
-        /* Swap V_curr and V_next pointers */
-        float *tmp = d_V_curr;
-        d_V_curr = d_V_next;
-        d_V_next = tmp;
-        d_V_final = d_V_curr; /* after swap, latest is in d_V_curr */
+        float *tmp = V_curr;
+        V_curr = V_next;
+        V_next = tmp;
+        V_final = V_curr;
     }
 
     CUDA_CHECK(cudaEventRecord(loop_end));
@@ -354,42 +408,21 @@ int main(int argc, char **argv) {
     int total_iters = (iter < max_iters) ? iter + 1 : max_iters;
 
     /* --------------------------------------------------------
-     * Copy results back to host
+     * Results are already accessible on the CPU — no copy needed.
+     * Just synchronize to ensure GPU kernels are done.
      * -------------------------------------------------------- */
-    cudaEvent_t copyback_start, copyback_end;
-    CUDA_CHECK(cudaEventCreate(&copyback_start));
-    CUDA_CHECK(cudaEventCreate(&copyback_end));
-
-    CUDA_CHECK(cudaEventRecord(copyback_start));
-
-    /*
-     * d_V_final tracks where the latest values are:
-     *   - If converged: d_V_next (kernel wrote there, no swap)
-     *   - If max_iters hit: d_V_curr (last swap moved it there)
-     */
-    CUDA_CHECK(cudaMemcpy(h_values, d_V_final, value_size,
-                          cudaMemcpyDeviceToHost));
-    CUDA_CHECK(cudaMemcpy(h_policy, d_policy, policy_size,
-                          cudaMemcpyDeviceToHost));
-
-    CUDA_CHECK(cudaEventRecord(copyback_end));
-    CUDA_CHECK(cudaEventSynchronize(copyback_end));
-
-    float copy_from_gpu_ms;
-    CUDA_CHECK(cudaEventElapsedTime(&copy_from_gpu_ms,
-                                    copyback_start, copyback_end));
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     /* --------------------------------------------------------
      * Print results
      * -------------------------------------------------------- */
     printf("\n=== Results ===\n");
     printf("Iterations: %d\n", total_iters);
-    printf("Copy to GPU: %.3f ms\n", copy_to_gpu_ms);
+    printf("Build time: %.3f ms\n", build_ms);
     printf("Iteration loop: %.2f ms\n", loop_ms);
     printf("Avg per iteration: %.3f ms\n", loop_ms / total_iters);
-    printf("Copy from GPU: %.3f ms\n", copy_from_gpu_ms);
-    printf("Total (copy + iterate + copy): %.2f ms\n",
-           copy_to_gpu_ms + loop_ms + copy_from_gpu_ms);
+    printf("Total: %.2f ms\n", build_ms + loop_ms);
+    printf("(No explicit copy to/from GPU)\n");
 
     /* Print policy near goal */
     const char *arrows = "^v<>";
@@ -408,9 +441,9 @@ int main(int argc, char **argv) {
         printf("%4d ", r);
         for (int c = bc0; c < cols; c++) {
             int s = r * cols + c;
-            if (gw->is_terminal[s])       printf("G");
-            else if (gw->is_obstacle[s])  printf("#");
-            else                          printf("%c", arrows[h_policy[s]]);
+            if (mgw.is_terminal[s])       printf("G");
+            else if (mgw.is_obstacle[s])  printf("#");
+            else                          printf("%c", arrows[policy[s]]);
         }
         printf("\n");
     }
@@ -423,10 +456,10 @@ int main(int argc, char **argv) {
         printf("%4d |", r);
         for (int c = cols - vc; c < cols; c++) {
             int s = r * cols + c;
-            if (gw->is_obstacle[s])
+            if (mgw.is_obstacle[s])
                 printf("  ####  ");
             else
-                printf(" %6.1f ", h_values[s]);
+                printf(" %6.1f ", V_final[s]);
         }
         printf("\n");
     }
@@ -434,10 +467,10 @@ int main(int argc, char **argv) {
     /* Save value function for comparison */
     char filename[256];
     snprintf(filename, sizeof(filename),
-             "discrete_values_%dx%d.bin", rows, cols);
+             "unified_values_%dx%d.bin", rows, cols);
     FILE *fp = fopen(filename, "wb");
     if (fp) {
-        fwrite(h_values, sizeof(float), N, fp);
+        fwrite(V_final, sizeof(float), N, fp);
         fclose(fp);
         printf("\nValue function saved to %s\n", filename);
     }
@@ -445,28 +478,20 @@ int main(int argc, char **argv) {
     /* --------------------------------------------------------
      * Cleanup
      * -------------------------------------------------------- */
-    CUDA_CHECK(cudaFree(d_transitions));
-    CUDA_CHECK(cudaFree(d_rewards));
-    CUDA_CHECK(cudaFree(d_is_terminal));
-    CUDA_CHECK(cudaFree(d_is_obstacle));
-    CUDA_CHECK(cudaFree(d_V_curr));
-    CUDA_CHECK(cudaFree(d_V_next));
-    CUDA_CHECK(cudaFree(d_deltas));
-    CUDA_CHECK(cudaFree(d_reduce_workspace));
-    CUDA_CHECK(cudaFree(d_policy));
+    CUDA_CHECK(cudaFree(mgw.transitions));
+    CUDA_CHECK(cudaFree(mgw.rewards));
+    CUDA_CHECK(cudaFree(mgw.is_terminal));
+    CUDA_CHECK(cudaFree(mgw.is_obstacle));
+    CUDA_CHECK(cudaFree(V_curr));
+    CUDA_CHECK(cudaFree(V_next));
+    CUDA_CHECK(cudaFree(deltas));
+    CUDA_CHECK(cudaFree(reduce_workspace));
+    CUDA_CHECK(cudaFree(policy));
 
-    CUDA_CHECK(cudaEventDestroy(copy_start));
-    CUDA_CHECK(cudaEventDestroy(copy_end));
-    CUDA_CHECK(cudaEventDestroy(iter_start));
-    CUDA_CHECK(cudaEventDestroy(iter_end));
+    CUDA_CHECK(cudaEventDestroy(build_start));
+    CUDA_CHECK(cudaEventDestroy(build_end));
     CUDA_CHECK(cudaEventDestroy(loop_start));
     CUDA_CHECK(cudaEventDestroy(loop_end));
-    CUDA_CHECK(cudaEventDestroy(copyback_start));
-    CUDA_CHECK(cudaEventDestroy(copyback_end));
-
-    free(h_values);
-    free(h_policy);
-    gridworld_free(gw);
 
     printf("Done.\n");
     return 0;

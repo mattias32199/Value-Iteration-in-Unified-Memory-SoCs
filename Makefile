@@ -13,7 +13,7 @@ OBJECTS = $(BUILD_DIR)/gridworld.o
 # Build CPU targets by default, CUDA targets explicitly
 all: test_gridworld cpu_vi
 
-cuda: discrete_vi
+cuda: discrete_vi unified_vi
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -34,7 +34,10 @@ cpu_vi: $(BUILD_DIR)/cpu_vi.o $(OBJECTS)
 discrete_vi: $(SRC_DIR)/discrete_vi.cu $(OBJECTS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(LDFLAGS)
 
+unified_vi: $(SRC_DIR)/unified_vi.cu $(OBJECTS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -rf $(BUILD_DIR) test_gridworld cpu_vi discrete_vi *.bin
+	rm -rf $(BUILD_DIR) test_gridworld cpu_vi discrete_vi unified_vi *.bin
 
 .PHONY: all cuda clean
