@@ -4,24 +4,24 @@ CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=c99
 LDFLAGS = -lm
 
-# Grid world library objects
-LIB_OBJS = gridworld.o verify.o
+SRC_DIR = src
+BUILD_DIR = build
 
-# Targets
+SOURCES = $(SRC_DIR)/gridworld.c $(SRC_DIR)/verify.c
+OBJECTS = $(BUILD_DIR)/gridworld.o $(BUILD_DIR)/verify.o
+
 all: test_gridworld
 
-test_gridworld: test_gridworld.o $(LIB_OBJS)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-%.o: %.c
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Dependencies
-test_gridworld.o: test_gridworld.c gridworld.h
-gridworld.o: gridworld.c gridworld.h
-verify.o: verify.c verify.h
+test_gridworld: $(BUILD_DIR)/test_gridworld.o $(OBJECTS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 clean:
-	rm -f *.o test_gridworld
+	rm -rf $(BUILD_DIR) test_gridworld
 
 .PHONY: all clean
