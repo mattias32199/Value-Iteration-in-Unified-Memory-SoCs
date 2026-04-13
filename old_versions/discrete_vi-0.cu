@@ -1,6 +1,16 @@
 // discrete_vi.cu
 /*
  * Discrete-memory CUDA value iteration (baseline).
+ *
+ * Standard GPU-accelerated approach:
+ *   - Host allocates with malloc, device allocates with cudaMalloc
+ *   - Explicit cudaMemcpy to transfer data between CPU and GPU
+ *   - Bellman update kernel: one thread per state
+ *   - Parallel reduction kernel: computes max |V_new - V_old|
+ *   - Convergence check on CPU after each sweep
+ *
+ * This is the conventional approach that the unified memory
+ * version will be compared against.
  */
 
 #include <stdio.h>
@@ -20,7 +30,7 @@ extern "C" {
     do {                                                                  \
         cudaError_t err = (call);                                         \
         if (err != cudaSuccess) {                                         \
-            fprintf(stderr, "CUDA error at %s:%d: %s\n",                  \
+            fprintf(stderr, "CUDA error at %s:%d: %s\n",                 \
                     __FILE__, __LINE__, cudaGetErrorString(err));          \
             exit(EXIT_FAILURE);                                           \
         }                                                                 \
@@ -28,15 +38,19 @@ extern "C" {
 
 /* ----------------------------------------------------------------
  * Bellman update kernel
+ *
+ * Each thread processes one state. Computes the best Q-value
+ * across all actions and writes the result to V_next.
+ * Also computes |V_next[s] - V_curr[s]| into a delta array.
  * ---------------------------------------------------------------- */
 __global__ void bellman_update_kernel(
-    const int *transitions,
-    const float *rewards,
+    const int *transitions,     /* [num_states * NUM_ACTIONS] */
+    const float *rewards,       /* [num_states * NUM_ACTIONS] */
     const int8_t *is_terminal,
     const int8_t *is_obstacle,
     const float *V_curr,
     float *V_next,
-    float *deltas,
+    float *deltas,              /* per-state delta for reduction */
     int *policy,
     int num_states,
     float gamma)
@@ -44,6 +58,7 @@ __global__ void bellman_update_kernel(
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= num_states) return;
 
+    /* Terminal and obstacle states stay at 0 */
     if (is_terminal[s] || is_obstacle[s]) {
         V_next[s] = 0.0f;
         deltas[s] = 0.0f;
@@ -75,6 +90,10 @@ __global__ void bellman_update_kernel(
 
 /* ----------------------------------------------------------------
  * Parallel max reduction kernel
+ *
+ * Reduces the deltas array to find the maximum value.
+ * Uses shared memory and sequential addressing for efficiency.
+ * Each block reduces its portion, then we reduce across blocks.
  * ---------------------------------------------------------------- */
 __global__ void max_reduce_kernel(
     const float *input,
@@ -86,12 +105,14 @@ __global__ void max_reduce_kernel(
     int tid = threadIdx.x;
     int i = blockIdx.x * (blockDim.x * 2) + threadIdx.x;
 
+    /* Load two elements per thread into shared memory */
     float val = 0.0f;
     if (i < n) val = input[i];
     if (i + blockDim.x < n) val = fmaxf(val, input[i + blockDim.x]);
     sdata[tid] = val;
     __syncthreads();
 
+    /* Reduction in shared memory */
     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
         if (tid < stride) {
             sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
@@ -99,6 +120,7 @@ __global__ void max_reduce_kernel(
         __syncthreads();
     }
 
+    /* Write block result */
     if (tid == 0) {
         output[blockIdx.x] = sdata[0];
     }
@@ -106,6 +128,9 @@ __global__ void max_reduce_kernel(
 
 /* ----------------------------------------------------------------
  * Host-side max reduction
+ *
+ * Launches reduction kernels iteratively until we have a single
+ * value, then copies it back to the host.
  * ---------------------------------------------------------------- */
 float gpu_max_reduce(float *d_input, float *d_workspace, int n) {
     int threads = 256;
@@ -122,11 +147,13 @@ float gpu_max_reduce(float *d_input, float *d_workspace, int n) {
 
         n = blocks;
 
+        /* Swap src and dst for next iteration */
         float *tmp = src;
         src = dst;
         dst = tmp;
     }
 
+    /* Copy the single result back to host */
     CUDA_CHECK(cudaMemcpy(&h_result, src, sizeof(float),
                           cudaMemcpyDeviceToHost));
     return h_result;
@@ -157,6 +184,7 @@ int main(int argc, char **argv) {
     printf("Threshold: %.1e\n", threshold);
     printf("Max iterations: %d\n\n", max_iters);
 
+    /* Print GPU info */
     cudaDeviceProp prop;
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     printf("GPU: %s\n", prop.name);
@@ -165,35 +193,21 @@ int main(int argc, char **argv) {
            prop.totalGlobalMem / (1024.0 * 1024.0));
 
     /* --------------------------------------------------------
-     * Build grid world on the CPU (Now with timing)
+     * Build grid world on the CPU
      * -------------------------------------------------------- */
     printf("Building grid world...\n");
-
-    cudaEvent_t build_start, build_end;
-    CUDA_CHECK(cudaEventCreate(&build_start));
-    CUDA_CHECK(cudaEventCreate(&build_end));
-
-    CUDA_CHECK(cudaEventRecord(build_start));
-
     GridWorld *gw = gridworld_create(rows, cols, -1.0f, 0.0f);
     if (!gw) return 1;
     gridworld_default_layout(gw);
     gridworld_build_transitions(gw);
-
-    CUDA_CHECK(cudaEventRecord(build_end));
-    CUDA_CHECK(cudaEventSynchronize(build_end));
-
-    float build_ms;
-    CUDA_CHECK(cudaEventElapsedTime(&build_ms, build_start, build_end));
 
     int n_obstacles = 0, n_terminals = 0;
     for (int i = 0; i < N; i++) {
         n_obstacles += gw->is_obstacle[i];
         n_terminals += gw->is_terminal[i];
     }
-    printf("Grid world ready (%d obstacles, %d terminals)\n",
+    printf("Grid world ready (%d obstacles, %d terminals)\n\n",
            n_obstacles, n_terminals);
-    printf("Build time: %.3f ms\n\n", build_ms);
 
     /* --------------------------------------------------------
      * Allocate host memory
@@ -224,6 +238,7 @@ int main(int argc, char **argv) {
     size_t value_size   = (size_t)N * sizeof(float);
     size_t policy_size  = (size_t)N * sizeof(int);
 
+    /* Workspace for reduction: needs at most N/2 floats */
     int reduce_blocks = (N + 511) / 512;
     size_t reduce_size = reduce_blocks * sizeof(float);
 
@@ -278,6 +293,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaEventCreate(&iter_start));
     CUDA_CHECK(cudaEventCreate(&iter_end));
 
+    /* Time the entire iteration loop */
     cudaEvent_t loop_start, loop_end;
     CUDA_CHECK(cudaEventCreate(&loop_start));
     CUDA_CHECK(cudaEventCreate(&loop_end));
@@ -287,9 +303,11 @@ int main(int argc, char **argv) {
 
     int iter;
     float max_delta;
-    float *d_V_final = d_V_next;
+    float *d_V_final = d_V_next; /* tracks where the latest values are */
 
     for (iter = 0; iter < max_iters; iter++) {
+
+        /* Launch Bellman update kernel */
         bellman_update_kernel<<<blocks, threads_per_block>>>(
             d_transitions, d_rewards,
             d_is_terminal, d_is_obstacle,
@@ -298,24 +316,28 @@ int main(int argc, char **argv) {
             N, gamma_val);
         CUDA_CHECK(cudaGetLastError());
 
+        /* Compute max delta via parallel reduction */
         max_delta = gpu_max_reduce(d_deltas, d_reduce_workspace, N);
 
+        /* Print progress */
         if ((iter + 1) % 100 == 0 || iter == 0) {
             printf("  Iteration %d: max_delta = %.8f\n",
                    iter + 1, max_delta);
         }
 
+        /* Check convergence */
         if (max_delta < threshold) {
             printf("  Converged at iteration %d (max_delta = %.8f)\n",
                    iter + 1, max_delta);
-            d_V_final = d_V_next;
+            d_V_final = d_V_next; /* kernel just wrote here */
             break;
         }
 
+        /* Swap V_curr and V_next pointers */
         float *tmp = d_V_curr;
         d_V_curr = d_V_next;
         d_V_next = tmp;
-        d_V_final = d_V_curr;
+        d_V_final = d_V_curr; /* after swap, latest is in d_V_curr */
     }
 
     CUDA_CHECK(cudaEventRecord(loop_end));
@@ -340,6 +362,11 @@ int main(int argc, char **argv) {
 
     CUDA_CHECK(cudaEventRecord(copyback_start));
 
+    /*
+     * d_V_final tracks where the latest values are:
+     *   - If converged: d_V_next (kernel wrote there, no swap)
+     *   - If max_iters hit: d_V_curr (last swap moved it there)
+     */
     CUDA_CHECK(cudaMemcpy(h_values, d_V_final, value_size,
                           cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(h_policy, d_policy, policy_size,
@@ -357,15 +384,12 @@ int main(int argc, char **argv) {
      * -------------------------------------------------------- */
     printf("\n=== Results ===\n");
     printf("Iterations: %d\n", total_iters);
-    printf("Build time: %.3f ms\n", build_ms);
     printf("Copy to GPU: %.3f ms\n", copy_to_gpu_ms);
     printf("Iteration loop: %.2f ms\n", loop_ms);
     printf("Avg per iteration: %.3f ms\n", loop_ms / total_iters);
     printf("Copy from GPU: %.3f ms\n", copy_from_gpu_ms);
-
-    // Standardize total format so the bash script matches both
-    float total_ms = build_ms + copy_to_gpu_ms + loop_ms + copy_from_gpu_ms;
-    printf("Total: %.2f ms\n", total_ms);
+    printf("Total (copy + iterate + copy): %.2f ms\n",
+           copy_to_gpu_ms + loop_ms + copy_from_gpu_ms);
 
     /* Print policy near goal */
     const char *arrows = "^v<>";
@@ -431,8 +455,6 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaFree(d_reduce_workspace));
     CUDA_CHECK(cudaFree(d_policy));
 
-    CUDA_CHECK(cudaEventDestroy(build_start));
-    CUDA_CHECK(cudaEventDestroy(build_end));
     CUDA_CHECK(cudaEventDestroy(copy_start));
     CUDA_CHECK(cudaEventDestroy(copy_end));
     CUDA_CHECK(cudaEventDestroy(iter_start));

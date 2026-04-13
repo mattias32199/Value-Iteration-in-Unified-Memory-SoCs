@@ -3,12 +3,6 @@
 # Benchmark script for value iteration implementations.
 # Runs discrete_vi and unified_vi across grid sizes and
 # saves timing results to a CSV file.
-#
-# Usage:
-#   ./benchmarks/run_all.sh
-#   ./benchmarks/run_all.sh [start] [end] [step]
-#
-# Defaults: grid sizes from 50x50 to 2000x2000 in steps of 50
 
 set -e
 
@@ -39,8 +33,8 @@ echo "Grid sizes: ${START} to ${END} (step ${STEP})"
 echo "Output: ${CSV_FILE}"
 echo ""
 
-# CSV header
-echo "implementation,grid_size,num_states,iterations,copy_to_gpu_ms,iteration_loop_ms,avg_iter_ms,copy_from_gpu_ms,total_ms" > "$CSV_FILE"
+# CSV header - Updated for explicit breakdown
+echo "implementation,grid_size,num_states,iterations,build_ms,copy_to_gpu_ms,iteration_loop_ms,copy_from_gpu_ms,avg_iter_ms,total_ms" > "$CSV_FILE"
 
 # Function to parse timing from discrete_vi output
 parse_discrete() {
@@ -49,13 +43,14 @@ parse_discrete() {
     local num_states=$((size * size))
 
     local iterations=$(echo "$output" | grep -E "(Converged at iteration|Warning: did not converge)" | head -1 | grep -oP '\d+' | head -1)
+    local build=$(echo "$output" | grep "Build time:" | grep -oP '[\d.]+' | head -1)
     local copy_to=$(echo "$output" | grep "Copy to GPU:" | grep -oP '[\d.]+' | head -1)
     local loop=$(echo "$output" | grep "Iteration loop:" | grep -oP '[\d.]+' | head -1)
     local avg_iter=$(echo "$output" | grep "Avg per iteration:" | grep -oP '[\d.]+' | head -1)
     local copy_from=$(echo "$output" | grep "Copy from GPU:" | grep -oP '[\d.]+' | head -1)
-    local total=$(echo "$output" | grep "Total (copy" | grep -oP '[\d.]+' | head -1)
+    local total=$(echo "$output" | grep "^Total:" | grep -oP '[\d.]+' | head -1)
 
-    echo "discrete,${size},${num_states},${iterations},${copy_to},${loop},${avg_iter},${copy_from},${total}"
+    echo "discrete,${size},${num_states},${iterations},${build},${copy_to},${loop},${copy_from},${avg_iter},${total}"
 }
 
 # Function to parse timing from unified_vi output
@@ -71,8 +66,8 @@ parse_unified() {
     local avg_iter=$(echo "$output" | grep "Avg per iteration:" | grep -oP '[\d.]+' | head -1)
     local total=$(echo "$output" | grep "^Total:" | grep -oP '[\d.]+' | head -1)
 
-    # Unified has no separate copy_to/copy_from, use build time and 0
-    echo "${impl_name},${size},${num_states},${iterations},${build},${loop},${avg_iter},0.0,${total}"
+    # Unified uses 0.0 for explicit transfers to keep columns perfectly aligned
+    echo "${impl_name},${size},${num_states},${iterations},${build},0.0,${loop},0.0,${avg_iter},${total}"
 }
 
 # Run benchmarks
@@ -85,7 +80,7 @@ for size in $(seq $START $STEP $END); do
         output=$(./discrete_vi $size $size 2>&1)
         result=$(parse_discrete "$output" "$size")
         echo "$result" >> "$CSV_FILE"
-        total=$(echo "$result" | cut -d',' -f9)
+        total=$(echo "$result" | cut -d',' -f10)
         echo "done (${total} ms)"
     else
         echo "  discrete_vi not found, skipping"
@@ -97,7 +92,7 @@ for size in $(seq $START $STEP $END); do
         output=$(./unified_vi $size $size 2>&1)
         result=$(parse_unified "$output" "$size" "unified")
         echo "$result" >> "$CSV_FILE"
-        total=$(echo "$result" | cut -d',' -f9)
+        total=$(echo "$result" | cut -d',' -f10)
         echo "done (${total} ms)"
     else
         echo "  unified_vi not found, skipping"
@@ -109,7 +104,7 @@ for size in $(seq $START $STEP $END); do
         output=$(./unified_vi_prefetch $size $size 2>&1)
         result=$(parse_unified "$output" "$size" "unified_prefetch")
         echo "$result" >> "$CSV_FILE"
-        total=$(echo "$result" | cut -d',' -f9)
+        total=$(echo "$result" | cut -d',' -f10)
         echo "done (${total} ms)"
     fi
 
