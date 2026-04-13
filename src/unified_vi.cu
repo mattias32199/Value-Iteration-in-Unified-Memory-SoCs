@@ -331,17 +331,36 @@ int main(int argc, char **argv) {
         int device;
         CUDA_CHECK(cudaGetDevice(&device));
 
+        #if CUDART_VERSION >= 13000
+                cudaMemLocation loc = {};
+                loc.type = cudaMemLocationTypeDevice;
+                loc.id = device;
+                // On new CUDA, PREFETCH_DEST turns into: loc, 0
+                #define PREFETCH_DEST loc, 0
+            #else
+                // On old CUDA, PREFETCH_DEST turns into: device
+                #define PREFETCH_DEST device
+        #endif
+
         size_t trans_size  = (size_t)N * NUM_ACTIONS * sizeof(int);
         size_t reward_size = (size_t)N * NUM_ACTIONS * sizeof(float);
         size_t flag_size   = (size_t)N * sizeof(int8_t);
 
         printf("Prefetching managed memory to GPU...\n");
-        CUDA_CHECK(cudaMemPrefetchAsync(mgw.transitions, trans_size, device));
-        CUDA_CHECK(cudaMemPrefetchAsync(mgw.rewards, reward_size, device));
-        CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_terminal, flag_size, device));
-        CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_obstacle, flag_size, device));
-        CUDA_CHECK(cudaMemPrefetchAsync(V_curr, value_size, device));
-        CUDA_CHECK(cudaMemPrefetchAsync(V_next, value_size, device));
+        // CUDA_CHECK(cudaMemPrefetchAsync(mgw.transitions, trans_size, device));
+        // CUDA_CHECK(cudaMemPrefetchAsync(mgw.rewards, reward_size, device));
+        // CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_terminal, flag_size, device));
+        // CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_obstacle, flag_size, device));
+        // CUDA_CHECK(cudaMemPrefetchAsync(V_curr, value_size, device));
+        // CUDA_CHECK(cudaMemPrefetchAsync(V_next, value_size, device));
+        // CUDA_CHECK(cudaDeviceSynchronize());
+
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.transitions, trans_size, PREFETCH_DEST));
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.rewards, reward_size, PREFETCH_DEST));
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_terminal, flag_size, PREFETCH_DEST));
+        CUDA_CHECK(cudaMemPrefetchAsync(mgw.is_obstacle, flag_size, PREFETCH_DEST));
+        CUDA_CHECK(cudaMemPrefetchAsync(V_curr, value_size, PREFETCH_DEST));
+        CUDA_CHECK(cudaMemPrefetchAsync(V_next, value_size, PREFETCH_DEST));
         CUDA_CHECK(cudaDeviceSynchronize());
         printf("Prefetch complete.\n\n");
     }
