@@ -13,7 +13,7 @@ OBJECTS = $(BUILD_DIR)/gridworld.o
 # Build CPU targets by default, CUDA targets explicitly
 all: test_gridworld cpu_vi
 
-cuda: discrete_vi unified_vi
+cuda: discrete_vi unified_vi unified_vi_prefetch
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -37,7 +37,10 @@ discrete_vi: $(SRC_DIR)/discrete_vi.cu $(OBJECTS)
 unified_vi: $(SRC_DIR)/unified_vi.cu $(OBJECTS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(LDFLAGS)
 
+unified_vi_prefetch: $(SRC_DIR)/unified_vi.cu $(OBJECTS)
+	$(NVCC) $(NVCCFLAGS) -DUSE_PREFETCH -o $@ $^ $(LDFLAGS)
+
 clean:
-	rm -rf $(BUILD_DIR) test_gridworld cpu_vi discrete_vi unified_vi *.bin
+	rm -rf $(BUILD_DIR) test_gridworld cpu_vi discrete_vi unified_vi unified_vi_prefetch *.bin
 
 .PHONY: all cuda clean
